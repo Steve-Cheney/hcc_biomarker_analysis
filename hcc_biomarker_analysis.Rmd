@@ -1,0 +1,438 @@
+---
+title: "Integrative Transcriptomic and Functional Analysis Reveals Biomarkers for HCC Diagnosis and Prognosis"
+output: html_document
+author: "Steve Cheney"
+date: "2024-12-17"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## GEO2R
+
+```{r}
+# Version info: R 4.2.2, Biobase 2.58.0, GEOquery 2.66.0, limma 3.54.0
+################################################################
+#   Differential expression analysis with limma
+library(GEOquery)
+library(limma)
+library(umap)
+
+# load series and platform data from GEO
+
+gset <- getGEO("GSE25097", GSEMatrix =TRUE, AnnotGPL=FALSE)
+if (length(gset) > 1) idx <- grep("GPL10687", attr(gset, "names")) else idx <- 1
+gset <- gset[[idx]]
+
+# make proper column names to match toptable 
+fvarLabels(gset) <- make.names(fvarLabels(gset))
+
+# group membership for all samples
+gsms <- paste0("00000011111111111111111111111111111111111111113333",
+        "33333333333333333333333333333333333333333333333333",
+        "33333333333333333333333333333333333333333333333333",
+        "33333333333333333333333333333333333333333333333333",
+        "33333333333333333333333333333333333333333333333333",
+        "33333333333333333333333333333333333333322222222222",
+        "22222222222222222222222222222222222222222222222222",
+        "22222222222222222222222222222222222222222222222222",
+        "22222222222222222222222222222222222222222222222222",
+        "22222222222222222222222222222222222222222222222222",
+        "22222222222222222222222222222222222222222222222222",
+        "2222222")
+sml <- strsplit(gsms, split="")[[1]]
+
+# log2 transformation
+ex <- exprs(gset)
+qx <- as.numeric(quantile(ex, c(0., 0.25, 0.5, 0.75, 0.99, 1.0), na.rm=T))
+LogC <- (qx[5] > 100) ||
+          (qx[6]-qx[1] > 50 && qx[2] > 0)
+if (LogC) { ex[which(ex <= 0)] <- NaN
+  exprs(gset) <- log2(ex) }
+
+# assign samples to groups and set up design matrix
+gs <- factor(sml)
+groups <- make.names(c("normal","cirrhotic","tumor","non_tumor"))
+levels(gs) <- groups
+gset$group <- gs
+design <- model.matrix(~group + 0, gset)
+colnames(design) <- levels(gs)
+
+gset <- gset[complete.cases(exprs(gset)), ] # skip missing values
+
+fit <- lmFit(gset, design)  # fit linear model
+
+# set up contrasts of interest and recalculate model coefficients
+cts <- paste(groups, c(tail(groups, -1), head(groups, 1)), sep="-")
+cont.matrix <- makeContrasts(contrasts=cts, levels=design)
+fit2 <- contrasts.fit(fit, cont.matrix)
+
+# compute statistics and table of top significant genes
+fit2 <- eBayes(fit2, 0.01)
+tT <- topTable(fit2, adjust="fdr", sort.by="B", number=250)
+
+tT <- subset(tT, select=c("ID","adj.P.Val","P.Value","F","GB_ACC","SPOT_ID"))
+write.table(tT, file=stdout(), row.names=F, sep="\t")
+
+# Visualize and quality control test results.
+# Build histogram of P-values for all genes. Normal test
+# assumption is that most genes are not differentially expressed.
+tT2 <- topTable(fit2, adjust="fdr", sort.by="B", number=Inf)
+hist(tT2$adj.P.Val, col = "grey", border = "white", xlab = "P-adj",
+  ylab = "Number of genes", main = "P-adj value distribution")
+
+# summarize test results as "up", "down" or "not expressed"
+dT <- decideTests(fit2, adjust.method="fdr", p.value=0.05, lfc=0)
+
+# Venn diagram of results
+vennDiagram(dT, circle.col=palette())
+
+# create Q-Q plot for t-statistic
+t.good <- which(!is.na(fit2$F)) # filter out bad probes
+qqt(fit2$t[t.good], fit2$df.total[t.good], main="Moderated t statistic")
+
+# volcano plot (log P-value vs log fold change)
+colnames(fit2) # list contrast names
+ct <- 1        # choose contrast of interest
+# Please note that the code provided to generate graphs serves as a guidance to
+# the users. It does not replicate the exact GEO2R web display due to multitude
+# of graphical options.
+# 
+# The following will produce basic volcano plot using limma function:
+volcanoplot(fit2, coef=ct, main=colnames(fit2)[ct], pch=20,
+  highlight=length(which(dT[,ct]!=0)), names=rep('+', nrow(fit2)))
+
+# MD plot (log fold change vs mean log expression)
+# highlight statistically significant (p-adj < 0.05) probes
+plotMD(fit2, column=ct, status=dT[,ct], legend=F, pch=20, cex=1)
+abline(h=0)
+
+################################################################
+# General expression data analysis
+ex <- exprs(gset)
+
+# box-and-whisker plot
+dev.new(width=3+ncol(gset)/6, height=5)
+ord <- order(gs)  # order samples by group
+palette(c("#1B9E77", "#7570B3", "#E7298A", "#E6AB02", "#D95F02",
+          "#66A61E", "#A6761D", "#B32424", "#B324B3", "#666666"))
+par(mar=c(7,4,2,1))
+title <- paste ("GSE25097", "/", annotation(gset), sep ="")
+boxplot(ex[,ord], boxwex=0.6, notch=T, main=title, outline=FALSE, las=2, col=gs[ord])
+legend("topleft", groups, fill=palette(), bty="n")
+dev.off()
+
+# expression value distribution
+par(mar=c(4,4,2,1))
+title <- paste ("GSE25097", "/", annotation(gset), " value distribution", sep ="")
+plotDensities(ex, group=gs, main=title, legend ="topright")
+
+# UMAP plot (dimensionality reduction)
+ex <- na.omit(ex) # eliminate rows with NAs
+ex <- ex[!duplicated(ex), ]  # remove duplicates
+ump <- umap(t(ex), n_neighbors = 15, random_state = 123)
+par(mar=c(3,3,2,6), xpd=TRUE)
+plot(ump$layout, main="UMAP plot, nbrs=15", xlab="", ylab="", col=gs, pch=20, cex=1.5)
+legend("topright", inset=c(-0.15,0), legend=levels(gs), pch=20,
+col=1:nlevels(gs), title="Group", pt.cex=1.5)
+library(ggrepel)
+
+# Base plot of points
+plot(ump$layout, pch = 19, xlab = "Dimension 1", ylab = "Dimension 2",
+     main = "Non-overlapping point labels")
+
+# Add text labels using ggrepel
+text_labels <- rownames(ump$layout)
+points_df <- as.data.frame(ump$layout)  # Convert layout to a data frame
+points_df$labels <- text_labels
+
+library(ggplot2)
+ggplot(points_df, aes(x = V1, y = V2, label = labels)) +
+    geom_point() +
+    geom_text_repel(size = 3) +  # Non-overlapping labels
+    labs(title = "Non-overlapping Point Labels",
+         x = "Dimension 1", y = "Dimension 2") +
+    theme_minimal()
+
+plotSA(fit2, main = "Mean variance trend, GSE25097")
+
+
+```
+
+## Adjusted Fold Change
+
+```{r}
+# Prepare the expression data and metadata
+expr_data <- exprs(gset)  # Log-transformed expression matrix
+metadata <- data.frame(group = gs)
+rownames(metadata) <- colnames(expr_data)
+
+# Subset for Tumor vs Normal comparison
+selected_samples <- metadata$group %in% c("normal", "tumor")
+expr_data_subset <- expr_data[, selected_samples]
+metadata_subset <- metadata[selected_samples, , drop=FALSE]
+metadata_subset$group <- droplevels(metadata_subset$group)
+
+# Create design matrix for Tumor vs Normal
+design <- model.matrix(~ group, metadata_subset)
+
+# Fit linear model (directly on log-transformed data)
+fit <- lmFit(expr_data_subset, design)
+fit <- eBayes(fit, trend=TRUE)  # Apply limma-trend for log-transformed data
+
+# Extract results: Tumor vs Normal
+results <- topTable(fit, coef="grouptumor", adjust="fdr", number=Inf)
+
+# Save results to CSV
+write.csv(results, "Limma_Trend_Tumor_vs_Normal_Results.csv", row.names=TRUE)
+
+# Volcano Plot
+results$significant <- ifelse(results$adj.P.Val < 0.01 & abs(results$logFC) > 2, "Yes", "No")
+library(ggplot2)
+ggplot(results, aes(x=logFC, y=-log10(adj.P.Val), color=significant)) +
+  geom_point(alpha=0.5) +
+  scale_color_manual(values=c("No"="grey", "Yes"="red")) +
+  theme_minimal() +
+  labs(title="Volcano Plot: Tumor vs Normal (p<0.01)",
+       x="Log2 Fold Change", y="-Log10 Adjusted P-Value") +
+  geom_vline(xintercept=c(-2, 2), linetype="dashed") +
+  geom_hline(yintercept=-log10(0.01), linetype="dashed")
+```
+
+## Functional Enrichment Analysis
+
+```{r}
+annotations <- data.frame(
+  ID = rownames(fData(gset)),                  # Probe IDs
+  GeneSymbol = fData(gset)$GeneSymbol,         # Gene symbols
+  EntrezID = fData(gset)$EntrezGeneID          # Entrez IDs
+)
+
+filtered_genes <- results[results$adj.P.Val < 0.05 & abs(results$logFC) > 2, ]
+
+probe_ids <- rownames(filtered_genes)
+
+filtered_genes$GeneSymbol <- annotations$GeneSymbol[match(probe_ids, annotations$ID)]
+filtered_genes$EntrezID <- annotations$EntrezID[match(probe_ids, annotations$ID)]
+
+# Step 3: Remove Rows with Missing Entrez IDs
+filtered_genes <- filtered_genes[!is.na(filtered_genes$EntrezID), ]
+
+# Step 4: Save Updated Table
+write.csv(filtered_genes, "Filtered_Genes_With_Annotations.csv", row.names = TRUE)
+
+# View Updated Table
+print("Filtered Genes with Gene Symbols and Entrez IDs:")
+print(head(filtered_genes))
+
+# Step 5: GO Enrichment Analysis
+library(clusterProfiler)
+library(org.Hs.eg.db)
+
+# Perform enrichment analysis using Entrez IDs
+go_enrich <- enrichGO(
+  gene = filtered_genes$EntrezID,
+  OrgDb = org.Hs.eg.db,
+  ont = "BP",
+  pAdjustMethod = "fdr",
+  pvalueCutoff = 0.05,
+  readable = TRUE
+)
+
+# Visualize Top GO Terms
+library(ggplot2)
+dotplot(go_enrich, showCategory = 10, title = "Top Enriched GO Terms (BP)")
+
+# Step 6: KEGG Pathway Analysis
+kegg_enrich <- enrichKEGG(
+  gene = filtered_genes$EntrezID,
+  organism = "hsa",
+  pvalueCutoff = 0.05
+)
+
+dotplot(kegg_enrich, showCategory = 10, title = "Top Enriched KEGG Pathways")
+
+# Save Enrichment Results
+write.csv(as.data.frame(go_enrich), "GO_Enrichment_Results.csv", row.names = TRUE)
+write.csv(as.data.frame(kegg_enrich), "KEGG_Enrichment_Results.csv", row.names = TRUE)
+
+```
+
+## ROC Analysis
+
+```{r}
+# Step 1: Ensure annotations contain Probe IDs and Gene Symbols
+head(annotations)
+
+# Step 2: Map Probe IDs in expr_data_subset to Gene Symbols
+gene_mapping <- annotations$GeneSymbol
+names(gene_mapping) <- annotations$ID  # Map probe IDs to gene symbols
+
+# Replace probe IDs in expr_data_subset with gene symbols
+rownames(expr_data_subset) <- gene_mapping[rownames(expr_data_subset)] # Comment this out if running again, will cause issues
+
+# Step 3: Remove rows with missing Gene Symbols (NAs)
+expr_data_subset <- expr_data_subset[!is.na(rownames(expr_data_subset)), ]
+
+# Step 4: Aggregate by Gene Symbols (if duplicates exist)
+expr_data_subset <- aggregate(. ~ rownames(expr_data_subset), data = as.data.frame(expr_data_subset), FUN = mean)
+rownames(expr_data_subset) <- expr_data_subset$`rownames(expr_data_subset)`
+expr_data_subset <- expr_data_subset[, -1]  # Remove gene symbol column after setting rownames
+
+# Step 5: Verify if "TOP2A" is now present
+print("Available genes in the expression data:")
+print(head(rownames(expr_data_subset)))
+```
+
+
+```{r}
+library(pROC)
+library(ggplot2)
+
+# Function to calculate ROC and AUC for a list of genes
+generate_top_auc_plots <- function(expr_data, metadata, group_column = "group", top_n = 10) {
+  # Prepare binary labels (0 for control/normal, 1 for case/tumor)
+  labels <- ifelse(metadata[[group_column]] == "tumor", 1, 0)
+  
+  # Initialize a list to store AUC values
+  auc_results <- data.frame(Gene = character(), AUC = numeric(), stringsAsFactors = FALSE)
+  
+  # Iterate through all genes in the expression data
+  for (gene in rownames(expr_data)) {
+    gene_expression <- as.numeric(expr_data[gene, ])  # Ensure predictor is numeric
+    if (all(is.na(gene_expression))) next  # Skip if all values are NA
+    
+    # Calculate ROC and AUC
+    roc_curve <- roc(labels, gene_expression, quiet = TRUE)
+    auc_value <- as.numeric(auc(roc_curve))  # Explicitly convert AUC to numeric
+    
+    # Store results
+    auc_results <- rbind(auc_results, data.frame(Gene = gene, AUC = auc_value))
+  }
+  
+  # Sort by AUC and select top N genes
+  auc_results <- auc_results[order(-auc_results$AUC, na.last = NA), ]  # Sort descending, handle NA
+  top_genes <- head(auc_results, top_n)
+  print("AUC Results Summary")
+  summary(auc_results)
+  
+  # Plot ROC curves for the top N genes
+  par(mfrow = c(3, 4))  # Layout for 12 plots (3 rows, 4 columns)
+  for (i in 1:nrow(top_genes)) {
+    gene <- top_genes$Gene[i]
+    gene_expression <- as.numeric(expr_data[gene, ])
+    roc_curve <- roc(labels, gene_expression, quiet = TRUE)
+    plot.roc(roc_curve, main = paste("ROC Curve for", gene, "\nAUC =", round(top_genes$AUC[i], 3)))
+  }
+  
+  # Reset plot layout
+  par(mfrow = c(1, 1))
+  
+  # Return the top AUC results
+  return(top_genes)
+}
+
+# Step 1: Run the function and generate plots
+top_auc_results <- generate_top_auc_plots(expr_data_subset, metadata_subset, group_column = "group", top_n = 100)
+
+# Step 2: Display the top 100 genes with their AUC values
+print("Top 100 Genes with Highest AUC Values:")
+print(top_auc_results)
+```
+
+### Bootstrap Validation
+
+```{r}
+library(boot)
+
+# Combine expression data and group labels into one data frame
+expr_with_labels <- as.data.frame(t(expr_data_subset))  # Transpose expression matrix
+expr_with_labels$group <- ifelse(metadata_subset$group == "tumor", 1, 0)
+
+# Define the bootstrap function
+boot_auc <- function(data, indices) {
+  # Resample data based on indices
+  resampled_data <- data[indices, ]
+  
+  # Check if labels have both levels (0 and 1)
+  if (length(unique(resampled_data$group)) < 2) {
+    return(NA)  # Skip iteration if one group is missing
+  }
+  
+  # Specify the gene to test
+  gene_expression <- resampled_data$TOP2A  # Testing TOP2A
+  labels <- resampled_data$group
+  
+  # Calculate ROC and AUC
+  roc_curve <- roc(labels, gene_expression)
+  return(auc(roc_curve))
+}
+
+# Apply bootstrapping for a specific gene
+set.seed(123)  # For reproducibility
+results <- boot(data = expr_with_labels, statistic = boot_auc, R = 1000)
+
+# Remove NA values caused by skipped iterations
+clean_auc_values <- results$t[!is.na(results$t)]
+
+# Print results
+print("Bootstrap Results:")
+print(summary(clean_auc_values))
+plot(density(clean_auc_values), main = "Bootstrap AUC Distribution for TOP2A", xlab = "AUC")
+```
+
+## Labeled Volcano Plot with Top 12 Candidates
+
+```{r}
+# Ensure the Biobase package is loaded
+if (!requireNamespace("Biobase", quietly = TRUE)) {
+  install.packages("Biobase", repos = "http://bioconductor.org/packages/release/bioc")
+}
+library(Biobase)
+
+gset <- getGEO("GSE25097", GSEMatrix = TRUE, AnnotGPL = TRUE)
+# Extract feature annotations
+annotations <- fData(gset[[1]])
+
+# Ensure annotations contain Probe IDs and Gene Symbols
+gene_mapping <- annotations$GeneSymbol  # Extract gene symbols
+names(gene_mapping) <- annotations$ID   # Set probe IDs as names
+
+# Load the results CSV
+results <- read.csv("Limma_Trend_Tumor_vs_Normal_Results.csv", row.names = 1)
+
+# Map Probe IDs in results to Gene Symbols
+results$GeneSymbol <- gene_mapping[rownames(results)]
+
+# Define the genes to highlight
+genes_to_highlight <- c("ANLN", "BUB1", "DLGAP5", "KIF23", "NDC80", "ORC6L",
+                        "PRC1", "PTTG1", "SKA1", "TOP2A", "TTK", "UBE2C")
+
+# Add a column for significance
+results$significant <- ifelse(results$adj.P.Val < 0.01 & abs(results$logFC) > 2, "Yes", "No")
+
+# Add a column for highlighting specific genes
+results$highlight <- ifelse(results$GeneSymbol %in% genes_to_highlight, "Highlighted", "Not Highlighted")
+
+# Add a column for labeling highlighted genes
+results$label <- ifelse(results$GeneSymbol %in% genes_to_highlight, results$GeneSymbol, NA)
+```
+
+```{r}
+ggplot(results, aes(x = logFC, y = -log10(adj.P.Val))) +
+  geom_point(aes(color = ifelse(!is.na(label), "Top 12", significant), 
+                 shape = highlight), alpha = 0.5) +
+  scale_color_manual(values = c("No" = "grey", "Yes" = "red", "Top 12" = "blue"),
+                     name = "Significance") +  # Set custom legend title
+  scale_shape_manual(values = c("Not Highlighted" = 16, "Highlighted" = 17),
+                     name = "Highlight") +  # Custom title for shapes
+  theme_minimal() +
+  labs(title = "Volcano Plot: Tumor vs Normal (p<0.01)",
+       x = "Log2 Fold Change", y = "-Log10 Adjusted P-Value") +
+  geom_vline(xintercept = c(-2, 2), linetype = "dashed") +
+  geom_hline(yintercept = -log10(0.01), linetype = "dashed") +
+  geom_text_repel(aes(label = label), max.overlaps = 10, size = 3, color = "blue") +
+  theme(legend.position = "right")
+
+```
